@@ -116,11 +116,12 @@ class AuthProtocol(object):
             identity = self._keystone_validate_token(token)
             if identity and memcache_client:
                 expires = identity['expires']
-                memcache_client.set(memcache_key,
-                                    (expires, identity),
-                                    timeout=expires - time())
-                ts = str(datetime.fromtimestamp(expires))
-                self.logger.debug('setting memcache expiration to %s' % ts)
+                if expires:
+                    memcache_client.set(memcache_key,
+                                        (expires, identity),
+                                        timeout=expires - time())
+                    ts = str(datetime.fromtimestamp(expires))
+                    self.logger.debug('setting memcache expiration to %s' % ts)
             else:  # if we didn't get identity it means there was an error.
                 return HTTPBadRequest(request=req)
 
@@ -140,6 +141,8 @@ class AuthProtocol(object):
 
     def convert_date(self, date):
         """ Convert datetime to unix timestamp """
+        if not date:
+            return
         return mktime(datetime.strptime(
                 date[:date.rfind(':')].replace('-', ''), "%Y%m%dT%H:%M",
                 ).timetuple())
