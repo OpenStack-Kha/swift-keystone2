@@ -17,6 +17,7 @@ import json
 
 from urllib import quote
 from urlparse import urlparse
+import httplib
 
 from webob.exc import HTTPForbidden, HTTPNotFound, \
     HTTPUnauthorized, HTTPBadRequest
@@ -112,8 +113,15 @@ class AuthProtocol(object):
                 identity = _identity
 
         if not identity:
-            self.logger.debug("No memcache, requesting it from keystone")
-            identity = self._keystone_validate_token(token)
+            if environ.get('HTTP_AUTHORIZATION'):
+                identity = self._keystone_validate_s3token(req, token)
+                if 'tenant' in identity:
+                    print identity
+                    environ['PATH_INFO'] = '/v1/AUTH_%s' % \
+                        identity['tenant'][0]
+            else:
+                identity = self._keystone_validate_token(token)
+
             if identity and memcache_client:
                 expires = identity['expires']
                 if expires:
@@ -137,6 +145,7 @@ class AuthProtocol(object):
         environ['REMOTE_USER'] = identity.get('tenant')
         environ['swift.authorize'] = self.authorize
         environ['swift.clean_acl'] = clean_acl
+
         return self.app(environ, start_response)
 
     def convert_date(self, date):
@@ -146,6 +155,46 @@ class AuthProtocol(object):
         return mktime(datetime.strptime(
                 date[:date.rfind(':')].replace('-', ''), "%Y%m%dT%H:%M",
                 ).timetuple())
+
+    def _keystone_validate_s3token(self, req, token):
+        access, signature = \
+            req.environ['HTTP_AUTHORIZATION'].split(' ')[1].rsplit(':', 1)
+
+        auth_params = dict(req.params)
+
+        # Authenticate the request.
+        creds = {
+            'credentials':
+                {'access': access,
+                 'token': token,
+                 'signature': signature,
+                 'host': req.host,
+                 'verb': req.method,
+                 'path': req.path,
+                 'params': auth_params,
+                 }}
+
+        headers = {'Content-Type': 'application/json'}
+        creds_json = json.dumps(creds)
+
+        #TODO!!!!!
+        conn = httplib.HTTPConnection("localhost:35357")
+        conn.request('POST', "/v2.0/s3tokens",
+                     body=creds_json,
+                     headers=headers)
+
+        resp = conn.getresponse()
+        data = resp .read()
+        conn.close()
+        self.logger.debug("Keystone came back with: status:%d, data:%s" % \
+                            (resp.status, data))
+
+        if not str(resp.status).startswith('20'):
+            #TODO: Make the self.keystone_url more meaningfull
+            raise Exception('Error: Keystone : %s Returned: %d' % \
+                                (self.keystone_url, resp.status))
+        identity_info = json.loads(data)
+        return self._parse_results(identity_info)
 
     def _keystone_validate_token(self, claim):
         """
@@ -170,7 +219,9 @@ class AuthProtocol(object):
             raise Exception('Error: Keystone : %s Returned: %d' % \
                                 (self.keystone_url, resp.status))
         identity_info = json.loads(data)
+        return self._parse_results(identity_info)
 
+    def _parse_results(self, identity_info):
         try:
             tenant = (identity_info['access']['token']['tenant']['id'],
                          identity_info['access']['token']['tenant']['name'])
@@ -181,8 +232,8 @@ class AuthProtocol(object):
                 identity_info['access']['user']['name']
             roles = [x['name'] for x in \
                          identity_info['access']['user']['roles']]
-        except (KeyError, IndexError):
-            raise
+        except (KeyError, IndexError), e:
+            raise e
 
         identity = {'user': user,
                     'tenant': tenant,
@@ -203,7 +254,8 @@ class AuthProtocol(object):
             return HTTPNotFound(request=req)
 
         if account != '%s_%s' % (self.reseller_prefix, tenant[0]):
-            self.logger.debug('tenant mismatch')
+            self.logger.debug('tenant mismatch: %s != %s_%s' % \
+                                  (account, self.reseller_prefix, tenant[0]))
             return self.denied_response(req)
 
         # If user is in the swift operator group then make the owner of it.
@@ -212,7 +264,7 @@ class AuthProtocol(object):
             _group = _group.strip()
             if  _group in user_groups:
                 self.logger.debug(
-                    "User is in group: %s allow him to do whatever it wants" % (_group))
+                    "User is in group: %s allows" % (_group))
                 req.environ['swift_owner'] = True
                 return None
 
